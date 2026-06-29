@@ -25,13 +25,26 @@
   .section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; margin:0 0 8px; font-weight:700; }
   .today h2{color:#c0392b;} .week h2{color:#b06a2c;} .later h2{color:#6b7280;} .done h2{color:#4b8b3b;}
   ul{list-style:none;margin:0;padding:0;}
-  li{display:flex;align-items:flex-start;gap:11px;background:#fff;border:1px solid #ece8e1;
-     border-radius:11px;padding:12px 13px;margin-bottom:7px;font-size:15px;}
+  /* Swipe: each row is a sliding foreground over fixed action backdrops */
+  .row{position:relative;margin-bottom:7px;border-radius:11px;overflow:hidden;}
+  .row .bg{position:absolute;inset:0;display:flex;align-items:center;justify-content:space-between;
+           font-size:13px;font-weight:700;color:#fff;padding:0 16px;}
+  .row .bg .done-side{color:#fff;} .row .bg.left{background:#4b8b3b;} /* complete (swipe right) */
+  .row .bg.right{background:#c0392b;justify-content:flex-end;} /* delete (swipe left) */
+  li{position:relative;display:flex;align-items:flex-start;gap:11px;background:#fff;border:1px solid #ece8e1;
+     border-radius:11px;padding:12px 13px;font-size:15px;transition:transform .18s ease;touch-action:pan-y;}
   .box{flex:0 0 auto;width:20px;height:20px;border:1.5px solid #c9c3b8;border-radius:6px;margin-top:1px;cursor:pointer;position:relative;}
   li.done{opacity:.6;} li.done .box{background:#4b8b3b;border-color:#4b8b3b;}
   li.done .box::after{content:"✓";color:#fff;font-size:13px;position:absolute;top:-1px;left:3px;}
   li.done .txt{text-decoration:line-through;}
+  .txt{flex:1;cursor:text;}
+  .txt input{width:100%;font:inherit;border:1px solid #b06a2c;border-radius:6px;padding:4px 6px;}
   .empty{color:#a8a298;font-size:14px;font-style:italic;padding:2px;}
+  .toolbar{display:flex;align-items:center;gap:14px;margin:0 0 14px;font-size:13px;}
+  .toolbar label{display:flex;align-items:center;gap:6px;color:#6b7280;cursor:pointer;}
+  .undo{position:fixed;left:50%;transform:translateX(-50%);bottom:78px;background:#1f1d1a;color:#fff;
+        padding:10px 16px;border-radius:24px;font-size:14px;display:none;align-items:center;gap:14px;z-index:9;}
+  .undo.show{display:flex;} .undo button{background:none;color:#ffb86b;font-weight:700;padding:0;}
   .bar{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid #ece8e1;
        padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:flex;gap:8px;}
   .bar input{flex:1;font:inherit;padding:10px 12px;border:1px solid #ddd6cb;border-radius:9px;}
@@ -51,6 +64,11 @@
     <button class="btn sec" id="refresh">Refresh</button>
   </header>
   <div class="syncline"><span class="dot" id="dot"></span><span id="status">Starting…</span></div>
+  <div class="toolbar" id="toolbar" style="display:none">
+    <label><input type="checkbox" id="hideDone"> Hide Done</label>
+    <span style="color:#c9c3b8">·</span>
+    <span style="color:#a8a298">Swipe → done · swipe ← delete · tap text to edit</span>
+  </div>
   <div id="err"></div>
 
   <div id="gate" class="gate">
@@ -65,6 +83,8 @@
   <input id="newtask" placeholder="Add a task to Today…" autocomplete="off">
   <button class="btn" id="add">Add</button>
 </div>
+
+<div class="undo" id="undo"><span id="undo-text">Task deleted</span><button id="undo-btn">Undo</button></div>
 
 <div class="overlay" id="conflict">
   <div class="card">
@@ -181,6 +201,7 @@ async function loadTasks(){
     render();
     $("content").style.display = "block";
     $("bar").style.display = "flex";
+    $("toolbar").style.display = "flex";
     setStatus("Up to date · loaded " + new Date().toLocaleTimeString(), "ok");
   }catch(e){ showErr("Couldn’t load: " + e.message); setStatus("Load failed","warn"); }
 }
@@ -245,19 +266,87 @@ function serialize(secs){
 }
 
 /* ----------  Render  ---------- */
+let hideDone = localStorage.getItem("hideDone") === "1";
 function render(){
   const cls = name => ({"Today":"today","This Week":"week","Later":"later","Done":"done"}[name]||"later");
   $("content").innerHTML = model.map(s=>{
+    if(hideDone && s.section==="Done") return "";
     const items = s.items.length
       ? "<ul>"+s.items.map((i,idx)=>
-          `<li class="${i.done?'done':''}" data-s="${s.section}" data-i="${idx}">
-             <span class="box" onclick="toggle('${s.section}',${idx})"></span>
-             <span class="txt">${esc(i.txt)}</span></li>`).join("")+"</ul>"
+          `<div class="row">
+             <div class="bg left">Done</div>
+             <div class="bg right">Delete</div>
+             <li class="${i.done?'done':''}" data-s="${esc(s.section)}" data-i="${idx}">
+               <span class="box" onclick="toggle('${esc(s.section)}',${idx})"></span>
+               <span class="txt" onclick="editTask('${esc(s.section)}',${idx},this)">${esc(i.txt)}</span>
+             </li>
+           </div>`).join("")+""
       : '<div class="empty">Nothing here.</div>';
     return `<div class="section ${cls(s.section)}"><h2>${esc(s.section)}</h2>${items}</div>`;
   }).join("");
+  attachSwipe();
 }
 function esc(s){return s.replace(/[&<>"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[m]));}
+
+/* ----------  Hide Done toggle  ---------- */
+$("hideDone").checked = hideDone;
+$("hideDone").onchange = () => { hideDone = $("hideDone").checked; localStorage.setItem("hideDone", hideDone?"1":"0"); render(); };
+
+/* ----------  Inline edit  ---------- */
+window.editTask = (section, idx, span) => {
+  const s = model.find(x=>x.section===section); if(!s) return;
+  const cur = s.items[idx].txt;
+  span.innerHTML = `<input value="${esc(cur)}">`;
+  const inp = span.querySelector("input"); inp.focus(); inp.select();
+  const commit = async () => {
+    const v = inp.value.trim();
+    if(v && v !== cur){ s.items[idx].txt = v; render(); await saveTasks(); }
+    else render();
+  };
+  inp.addEventListener("blur", commit);
+  inp.addEventListener("keydown", e=>{ if(e.key==="Enter"){ inp.blur(); } if(e.key==="Escape"){ render(); } });
+};
+
+/* ----------  Swipe (complete right / delete left)  ---------- */
+function attachSwipe(){
+  document.querySelectorAll(".row li").forEach(li=>{
+    let x0=null, dx=0;
+    li.addEventListener("pointerdown", e=>{ if(e.target.tagName==="INPUT"||e.target.classList.contains("box")) return; x0=e.clientX; dx=0; li.setPointerCapture(e.pointerId); });
+    li.addEventListener("pointermove", e=>{ if(x0===null) return; dx=e.clientX-x0; li.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`; });
+    li.addEventListener("pointerup", async e=>{
+      if(x0===null) return; const moved=dx; x0=null; li.style.transform="";
+      const section=li.dataset.s, idx=+li.dataset.i;
+      if(moved>70){ await swipeComplete(section, idx); }
+      else if(moved<-70){ await swipeDelete(section, idx); }
+    });
+    li.addEventListener("pointercancel", ()=>{ x0=null; li.style.transform=""; });
+  });
+}
+async function swipeComplete(section, idx){
+  const s = model.find(x=>x.section===section); if(!s) return;
+  s.items[idx].done = !s.items[idx].done; render(); await saveTasks();
+}
+let lastDeleted = null, undoTimer = null;
+async function swipeDelete(section, idx){
+  const s = model.find(x=>x.section===section); if(!s) return;
+  lastDeleted = { section, idx, item: s.items[idx] };
+  s.items.splice(idx,1); render();
+  const ok = await saveTasks();
+  if(ok){ showUndo(); }
+  else { /* conflict: reload handled by overlay */ lastDeleted=null; }
+}
+function showUndo(){
+  $("undo-text").textContent = `Deleted "${lastDeleted.item.txt.slice(0,28)}"`;
+  $("undo").classList.add("show");
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(()=>{ $("undo").classList.remove("show"); lastDeleted=null; }, 5000);
+}
+$("undo-btn").onclick = async () => {
+  if(!lastDeleted) return;
+  const s = model.find(x=>x.section===lastDeleted.section);
+  if(s){ s.items.splice(Math.min(lastDeleted.idx, s.items.length),0,lastDeleted.item); render(); await saveTasks(); }
+  $("undo").classList.remove("show"); lastDeleted=null; clearTimeout(undoTimer);
+};
 
 /* ----------  Edits (each triggers a guarded save)  ---------- */
 window.toggle = async (section, idx) => {
