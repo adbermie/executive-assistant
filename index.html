@@ -115,6 +115,11 @@
 /* ----------  State  ---------- */
 let tokenClient, accessToken = null, tokenExpiry = 0;
 let tokenWaiters = [];            // resolve callbacks waiting on a silent token refresh
+// Restore a still-valid token from a previous load so reload doesn't re-auth.
+try {
+  const saved = JSON.parse(localStorage.getItem("ea_token") || "null");
+  if(saved && saved.t && saved.e && Date.now() < saved.e){ accessToken = saved.t; tokenExpiry = saved.e; }
+} catch(_){}
 let fileId = localStorage.getItem("tasksFileId") || null;
 let loadedRevision = null;        // headRevisionId at last successful load — the sync guard
 let model = [];                   // [{section, items:[{done,txt}]}]
@@ -144,6 +149,8 @@ function initAuth(){
       }
       accessToken = resp.access_token;
       tokenExpiry = Date.now() + (resp.expires_in ? (resp.expires_in-60)*1000 : 3000*1000); // refresh 60s early
+      // Persist so a page/app reload reuses the token instead of re-authing.
+      try { localStorage.setItem("ea_token", JSON.stringify({ t: accessToken, e: tokenExpiry })); } catch(_){}
       $("gate").style.display = "none";
       const waiters = tokenWaiters; tokenWaiters = [];
       waiters.forEach(w=>w(accessToken));
@@ -174,7 +181,7 @@ async function drive(path, opts={}){
     ...opts,
     headers: { Authorization: "Bearer " + tok, ...(opts.headers||{}) }
   });
-  if(r.status === 401){ accessToken=null; tokenExpiry=0; throw new Error("auth expired"); }
+  if(r.status === 401){ accessToken=null; tokenExpiry=0; try{localStorage.removeItem("ea_token");}catch(_){} throw new Error("auth expired"); }
   return r;
 }
 async function driveUpload(path, opts={}){
@@ -183,7 +190,7 @@ async function driveUpload(path, opts={}){
   const r = await fetch("https://www.googleapis.com/upload/drive/v3/" + path, {
     ...opts, headers:{ Authorization:"Bearer "+tok, ...(opts.headers||{}) }
   });
-  if(r.status === 401){ accessToken=null; tokenExpiry=0; throw new Error("auth expired"); }
+  if(r.status === 401){ accessToken=null; tokenExpiry=0; try{localStorage.removeItem("ea_token");}catch(_){} throw new Error("auth expired"); }
   return r;
 }
 
@@ -410,7 +417,14 @@ window.onload = () => {
   if(CONFIG.CLIENT_ID.startsWith("PASTE") || CONFIG.APP_ID.startsWith("PASTE") || CONFIG.API_KEY.startsWith("PASTE")){ showErr("Not configured yet — paste your OAuth Client ID, Cloud project number (APP_ID), and API key into index.html (see SETUP guide)."); setStatus("Needs setup","warn"); return; }
   gapi.load("client", ()=>{});
   initAuth();
-  setStatus("Ready — sign in", "");
+  // If we restored a valid token AND already know the file, skip the gate and load straight away.
+  if(accessToken && Date.now() < tokenExpiry){
+    $("gate").style.display = "none";
+    setStatus("Resuming…", "busy");
+    ensureFile();
+  } else {
+    setStatus("Ready — sign in", "");
+  }
 };
 
 /* Register service worker for installability */
