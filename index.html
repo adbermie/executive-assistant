@@ -78,6 +78,9 @@
 <script>
   const CONFIG = {
     CLIENT_ID: "1049762369070-jflv08bm7t4a3hmal5qvooe0a5k92t0b.apps.googleusercontent.com",   // ends in .apps.googleusercontent.com
+    // REQUIRED for the Picker to actually grant drive.file access (fixes 403 on selecting TASKS.md):
+    APP_ID:    "1049762369070",  // numeric project number (NOT the project ID)
+    API_KEY:   "AIzaSyAdaPaIM0dmf0aLDfJgBzvsHZQYC8KhtC4",              // an API key from the same Cloud project
     // drive.file = least privilege; app sees only files you pick/create.
     SCOPE: "https://www.googleapis.com/auth/drive.file"
   };
@@ -142,6 +145,8 @@ async function ensureFile(){
     const picker = new google.picker.PickerBuilder()
       .addView(view)
       .setOAuthToken(accessToken)
+      .setDeveloperKey(CONFIG.API_KEY)   // API key — required for Picker
+      .setAppId(CONFIG.APP_ID)           // Cloud project NUMBER — required so drive.file grant sticks (fixes 403)
       .setCallback((data) => {
         if(data.action === google.picker.Action.PICKED){
           fileId = data.docs[0].id;
@@ -272,7 +277,7 @@ $("newtask").addEventListener("keydown", e=>{ if(e.key==="Enter") $("add").click
 
 /* ----------  Boot  ---------- */
 window.onload = () => {
-  if(CONFIG.CLIENT_ID.startsWith("PASTE")){ showErr("Not configured yet — paste your OAuth Client ID into index.html (see SETUP guide)."); setStatus("Needs setup","warn"); return; }
+  if(CONFIG.CLIENT_ID.startsWith("PASTE") || CONFIG.APP_ID.startsWith("PASTE") || CONFIG.API_KEY.startsWith("PASTE")){ showErr("Not configured yet — paste your OAuth Client ID, Cloud project number (APP_ID), and API key into index.html (see SETUP guide)."); setStatus("Needs setup","warn"); return; }
   gapi.load("client", ()=>{});
   initAuth();
   setStatus("Ready — sign in", "");
