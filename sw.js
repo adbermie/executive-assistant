@@ -1,6 +1,6 @@
 // Minimal service worker — required for PWA installability on Android.
 // Network-first so the app always tries fresh Drive data; cache only the shell.
-const SHELL = "tasks-shell-v2";
+const SHELL = "tasks-shell-v3";
 const ASSETS = ["./index.html", "./manifest.webmanifest"];
 
 self.addEventListener("install", e => {

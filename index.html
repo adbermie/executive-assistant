@@ -27,11 +27,14 @@
   ul{list-style:none;margin:0;padding:0;}
   /* Swipe: each row is a sliding foreground over fixed action backdrops */
   .row{position:relative;margin-bottom:7px;border-radius:11px;overflow:hidden;}
-  .row .bg{position:absolute;inset:0;display:flex;align-items:center;justify-content:space-between;
-           font-size:13px;font-weight:700;color:#fff;padding:0 16px;}
-  .row .bg .done-side{color:#fff;} .row .bg.left{background:#4b8b3b;} /* complete (swipe right) */
-  .row .bg.right{background:#c0392b;justify-content:flex-end;} /* delete (swipe left) */
-  li{position:relative;display:flex;align-items:flex-start;gap:11px;background:#fff;border:1px solid #ece8e1;
+  /* Action backdrops are hidden until an actual swipe is in progress (.swiping),
+     so the Delete/Done labels never peek behind a resting (or wrapped) task. */
+  .row .bg{position:absolute;inset:0;display:flex;align-items:center;font-size:13px;font-weight:700;
+           color:#fff;padding:0 18px;opacity:0;transition:opacity .12s;}
+  .row.swiping .bg{opacity:1;}
+  .row .bg.left{background:#4b8b3b;justify-content:flex-start;}   /* complete (swipe right) */
+  .row .bg.right{background:#c0392b;justify-content:flex-end;}    /* delete (swipe left) */
+  li{position:relative;z-index:1;display:flex;align-items:flex-start;gap:11px;background:#fff;border:1px solid #ece8e1;
      border-radius:11px;padding:12px 13px;font-size:15px;transition:transform .18s ease;touch-action:pan-y;}
   .box{flex:0 0 auto;width:20px;height:20px;border:1.5px solid #c9c3b8;border-radius:6px;margin-top:1px;cursor:pointer;position:relative;}
   li.done{opacity:.6;} li.done .box{background:#4b8b3b;border-color:#4b8b3b;}
@@ -110,7 +113,8 @@
 <script src="https://accounts.google.com/gsi/client"></script>
 <script>
 /* ----------  State  ---------- */
-let tokenClient, accessToken = null;
+let tokenClient, accessToken = null, tokenExpiry = 0;
+let tokenWaiters = [];            // resolve callbacks waiting on a silent token refresh
 let fileId = localStorage.getItem("tasksFileId") || null;
 let loadedRevision = null;        // headRevisionId at last successful load — the sync guard
 let model = [];                   // [{section, items:[{done,txt}]}]
@@ -121,35 +125,65 @@ const $ = id => document.getElementById(id);
 function setStatus(text, kind){ $("status").textContent = text; $("dot").className = "dot " + (kind||""); }
 function showErr(msg){ $("err").innerHTML = msg ? `<div class="err">${msg}</div>` : ""; }
 
-/* ----------  Auth  ---------- */
+/* ----------  Auth  ----------
+   First sign-in: interactive (consent popup). Afterwards tokens are refreshed
+   SILENTLY (prompt:"none") in the background — no popup on every refresh. */
 function initAuth(){
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CONFIG.CLIENT_ID,
     scope: CONFIG.SCOPE,
+    prompt: "",                       // default: only prompt when Google needs it
     callback: (resp) => {
-      if(resp.error){ showErr("Sign-in failed: " + resp.error); return; }
+      if(resp.error){
+        // Silent refresh can fail if interaction is required; fall back to gate.
+        tokenWaiters.forEach(w=>w(null)); tokenWaiters=[];
+        if(resp.error === "interaction_required" || resp.error === "login_required"){
+          $("gate").style.display = "block"; setStatus("Sign in again","warn");
+        } else { showErr("Sign-in failed: " + resp.error); }
+        return;
+      }
       accessToken = resp.access_token;
+      tokenExpiry = Date.now() + (resp.expires_in ? (resp.expires_in-60)*1000 : 3000*1000); // refresh 60s early
       $("gate").style.display = "none";
-      ensureFile();
+      const waiters = tokenWaiters; tokenWaiters = [];
+      waiters.forEach(w=>w(accessToken));
+      if(!waiters.length) ensureFile();   // first interactive sign-in path
     }
   });
 }
-$("signin").onclick = () => tokenClient.requestAccessToken({prompt: ""});
+// First, explicit sign-in (may show account/consent UI).
+$("signin").onclick = () => tokenClient.requestAccessToken({ prompt: "consent" });
+
+// Returns a valid token, refreshing silently if expired. No popup unless Google forces one.
+function getToken(){
+  if(accessToken && Date.now() < tokenExpiry) return Promise.resolve(accessToken);
+  return new Promise(resolve=>{
+    tokenWaiters.push(resolve);
+    if(tokenWaiters.length === 1){
+      try { tokenClient.requestAccessToken({ prompt: "" }); }  // silent: reuses existing Google session
+      catch(e){ tokenWaiters.forEach(w=>w(null)); tokenWaiters=[]; resolve(null); }
+    }
+  });
+}
 
 /* ----------  Drive REST (with revision guard)  ---------- */
 async function drive(path, opts={}){
+  const tok = await getToken();
+  if(!tok) throw new Error("auth required");
   const r = await fetch("https://www.googleapis.com/drive/v3/" + path, {
     ...opts,
-    headers: { Authorization: "Bearer " + accessToken, ...(opts.headers||{}) }
+    headers: { Authorization: "Bearer " + tok, ...(opts.headers||{}) }
   });
-  if(r.status === 401){ accessToken=null; $("gate").style.display="block"; throw new Error("auth expired"); }
+  if(r.status === 401){ accessToken=null; tokenExpiry=0; throw new Error("auth expired"); }
   return r;
 }
 async function driveUpload(path, opts={}){
+  const tok = await getToken();
+  if(!tok) throw new Error("auth required");
   const r = await fetch("https://www.googleapis.com/upload/drive/v3/" + path, {
-    ...opts, headers:{ Authorization:"Bearer "+accessToken, ...(opts.headers||{}) }
+    ...opts, headers:{ Authorization:"Bearer "+tok, ...(opts.headers||{}) }
   });
-  if(r.status === 401){ accessToken=null; $("gate").style.display="block"; throw new Error("auth expired"); }
+  if(r.status === 401){ accessToken=null; tokenExpiry=0; throw new Error("auth expired"); }
   return r;
 }
 
@@ -310,16 +344,23 @@ window.editTask = (section, idx, span) => {
 /* ----------  Swipe (complete right / delete left)  ---------- */
 function attachSwipe(){
   document.querySelectorAll(".row li").forEach(li=>{
-    let x0=null, dx=0;
+    let x0=null, dx=0; const row=li.closest(".row");
     li.addEventListener("pointerdown", e=>{ if(e.target.tagName==="INPUT"||e.target.classList.contains("box")) return; x0=e.clientX; dx=0; li.setPointerCapture(e.pointerId); });
-    li.addEventListener("pointermove", e=>{ if(x0===null) return; dx=e.clientX-x0; li.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`; });
+    li.addEventListener("pointermove", e=>{ if(x0===null) return; dx=e.clientX-x0;
+      if(Math.abs(dx)>6) row.classList.add("swiping");
+      // Only reveal the side being swiped toward
+      row.querySelector(".bg.left").style.opacity = dx>0 ? 1 : 0;
+      row.querySelector(".bg.right").style.opacity = dx<0 ? 1 : 0;
+      li.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`; });
     li.addEventListener("pointerup", async e=>{
-      if(x0===null) return; const moved=dx; x0=null; li.style.transform="";
+      if(x0===null) return; const moved=dx; x0=null;
+      li.style.transform=""; row.classList.remove("swiping");
+      row.querySelectorAll(".bg").forEach(b=>b.style.opacity="");
       const section=li.dataset.s, idx=+li.dataset.i;
       if(moved>70){ await swipeComplete(section, idx); }
       else if(moved<-70){ await swipeDelete(section, idx); }
     });
-    li.addEventListener("pointercancel", ()=>{ x0=null; li.style.transform=""; });
+    li.addEventListener("pointercancel", ()=>{ x0=null; li.style.transform=""; row.classList.remove("swiping"); row.querySelectorAll(".bg").forEach(b=>b.style.opacity=""); });
   });
 }
 async function swipeComplete(section, idx){
